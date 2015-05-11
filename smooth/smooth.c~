@@ -1,0 +1,944 @@
+/*  
+    smooth.c
+    Nate Robins, 1998
+
+    Model viewer program.  Exercises the glm library.
+*/
+
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <stdarg.h>
+#include <GL/glut.h>
+#include "gltb.h"
+#include "glm.h"
+#include "dirent32.h"
+
+#pragma comment( linker, "/entry:\"mainCRTStartup\"" )  // set the entry point to be main()
+
+#define DATA_DIR "data/"
+
+char*      model_file = NULL;		/* name of the obect file */
+GLuint     model_list = 0;		    /* display list for object */
+GLMmodel*  model;			        /* glm model data structure */
+GLfloat    scale;			        /* original scale factor */
+GLfloat    smoothing_angle = 90.0;	/* smoothing angle */
+GLfloat    weld_distance = 0.00001;	/* epsilon for welding vertices */
+GLboolean  facet_normal = GL_FALSE;	/* draw with facet normal? */
+GLboolean  bounding_box = GL_FALSE;	/* bounding box on? */
+GLboolean  performance = GL_FALSE;	/* performance counter on? */
+GLboolean  stats = GL_FALSE;		/* statistics on? */
+GLuint     material_mode = 0;		/* 0=none, 1=color, 2=material */
+GLint      entries = 0;			    /* entries in model menu */
+GLint      ycount = 0;
+GLint      gcount = 0;
+GLdouble   pan_x = 0.0;
+GLdouble   pan_y = 0.0;
+GLdouble   pan_z = 0.0;
+//unsigned int pixels[512][512][3];
+
+GLfloat  pixels[512][512][3];
+
+float zBuffer[512][512];
+
+void myDisplay(void);
+int min1(int a, int b)
+{
+	return a < b ? a : b;
+}
+
+int max1(int a , int b)
+{
+	return a>b ? a : b;
+}
+
+float max2(float a, float b)
+{
+	return a > b ? a : b;
+}
+
+#define CLK_TCK 1000
+#if defined(_WIN32)
+#include <sys/timeb.h>
+#else
+#include <limits.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/times.h>
+#endif
+float
+elapsed(void)
+{
+    static long begin = 0;
+    static long finish, difference;
+    
+#if defined(_WIN32)
+    static struct timeb tb;
+    ftime(&tb);
+    finish = tb.time*1000+tb.millitm;
+#else
+    static struct tms tb;
+    finish = times(&tb);
+#endif
+    
+    difference = finish - begin;
+    begin = finish;
+    
+    return (float)difference/(float)CLK_TCK;
+}
+
+float areaTriangle(int x0, int y0, int x1, int y1, int x2, int y2)
+{
+	float a0a1 = sqrtf((x0 - x1)*(x0 - x1) + (y0-y1)*(y0-y1));
+	float a1a2 = sqrtf((x2 - x1)*(x2 - x1) + (y2 - y1)*(y2 - y1));
+	float a2a0 = sqrtf((x0 - x2)*(x0 - x2) + (y0 - y2)*(y0 - y2));
+
+	float s = (a0a1 + a1a2 + a2a0) / 2;
+	float area = sqrtf(s*(s-a0a1)*(s-a1a2)*(s-a2a0));
+	return area;
+}
+
+void DrawLine1(int x0, int y0, float z0, int x1, int y1, float z1, GLfloat color[3], GLfloat color1[3], GLfloat color2[3]) {
+	int xStart, yStart, dx, dy, err, temp,sx,sy,e2;
+	float distFromStart, distFromEnd, edgeLength, zCurrent,zStart;
+
+	xStart = x0;
+	yStart = y0;
+	zStart = z0;
+
+	dx = abs(x1 - x0), sx = x0<x1 ? 1 : -1;
+	dy = abs(y1 - y0), sy = y0<y1 ? 1 : -1;
+	err = (dx>dy ? dx : -dy) / 2, e2;
+
+	for (;;){
+
+		distFromStart = sqrtf((x0 - xStart)*(x0 - xStart) + (y0 - yStart)*(y0 - yStart));
+		distFromEnd = sqrtf((x0 - x1)*(x0 - x1) + (y0 - y1)*(y0 - y1));
+		edgeLength = distFromStart + distFromEnd;
+		zCurrent = (z0*distFromEnd + z1*distFromStart) / edgeLength;
+		if (gcount%2==1)
+		{
+			for (temp = 0; temp<3; temp++)
+				color[temp] = (distFromEnd*color1[temp] + distFromStart*color2[temp]) / edgeLength;
+		}
+		if (zBuffer[x0][y0] > zCurrent)
+		{
+			zBuffer[x0][y0] = zCurrent;
+			pixels[(int)y0][(int)x0][0] = color[0];
+			pixels[(int)y0][(int)x0][1] = color[1];
+			pixels[(int)y0][(int)x0][2] = color[2];
+
+		}
+		if (x0 == x1 && y0 == y1) break;
+		e2 = err;
+		if (e2 >-dx) { err -= dy; x0 += sx; }
+		if (e2 < dy) { err += dx; y0 += sy; }
+	}
+}
+
+void scanFill3(float vertices[4][3], GLfloat color[3], GLfloat color1[3], GLfloat color2[3], GLfloat color3[3])
+{
+	int xmin, xmax, ymin, ymax,x,y,temp;
+	float f12xy, f12x0y0, f20xy, f20x1y1, f01xy, f01x2y2, alpha, beta, gamma, zCurrent;
+
+	xmin = floor(min1((int)vertices[0][0], min1((int)vertices[1][0], (int)vertices[2][0])));
+	xmax = ceil(max1((int)vertices[0][0], max1((int)vertices[1][0], (int)vertices[2][0])));
+	ymin = floor(min1((int)vertices[0][1], min1((int)vertices[1][1], (int)vertices[2][1])));
+	ymax = ceil(max1((int)vertices[0][1], max1((int)vertices[1][1], (int)vertices[2][1])));
+
+	for (y = ymin; y < ymax; y++)
+	{
+		for (x = xmin; x < xmax; x++)
+		{
+			f12xy = ((int)vertices[1][1] - (int)vertices[2][1])*x + ((int)vertices[2][0] - (int)vertices[1][0])*y + (int)vertices[1][0] * (int)vertices[2][1] - (int)vertices[2][0] * (int)vertices[1][1];
+			f12x0y0 = ((int)vertices[1][1] - (int)vertices[2][1])*(int)vertices[0][0] + ((int)vertices[2][0] - (int)vertices[1][0])*(int)vertices[0][1] + (int)vertices[1][0] * (int)vertices[2][1] - (int)vertices[2][0] * (int)vertices[1][1];
+
+			f20xy = ((int)vertices[2][1] - (int)vertices[0][1])*x + ((int)vertices[0][0] - (int)vertices[2][0])*y + (int)vertices[2][0] * (int)vertices[0][1] - (int)vertices[0][0] * (int)vertices[2][1];
+			f20x1y1 = ((int)vertices[2][1] - (int)vertices[0][1])*(int)vertices[1][0] + ((int)vertices[0][0] - (int)vertices[2][0])*(int)vertices[1][1] + (int)vertices[2][0] * (int)vertices[0][1] - (int)vertices[0][0] * (int)vertices[2][1];
+
+			f01xy = ((int)vertices[0][1] - (int)vertices[1][1])*x + ((int)vertices[1][0] - (int)vertices[0][0])*y + (int)vertices[0][0] * (int)vertices[1][1] - (int)vertices[1][0] * (int)vertices[0][1];
+			f01x2y2 = ((int)vertices[0][1] - (int)vertices[1][1])*(int)vertices[2][0] + ((int)vertices[1][0] - (int)vertices[0][0])*(int)vertices[2][1] + (int)vertices[0][0] * (int)vertices[1][1] - (int)vertices[1][0] * (int)vertices[0][1];
+
+			alpha = f12xy / f12x0y0;
+			beta = f20xy / f20x1y1;
+			gamma = f01xy / f01x2y2;
+			/*float area12 = areaTriangle(vertices[0][0],vertices[0][1],x,y,vertices[1][0],vertices[1][1]);
+			float area13 = areaTriangle(vertices[0][0], vertices[0][1], x, y, vertices[2][0], vertices[2][1]);
+			float area23 = areaTriangle(vertices[1][0], vertices[1][1], x, y, vertices[2][0], vertices[2][1]);
+			float totalArea = area12 + area13 + area23;
+			alpha = area23 / totalArea;
+			beta = area13 / totalArea;
+			gamma = 1 - alpha - beta;*/
+
+			zCurrent = alpha*vertices[0][2]+ beta*vertices[1][2] + gamma*vertices[2][2];
+
+			if (gcount%2==1)
+			{
+				for (temp = 0; temp<3; temp++)
+					color[temp] = alpha*color1[temp] + beta*color2[temp] + gamma*color3[temp];
+			}
+
+			if (alpha > 0 && beta > 0 && gamma > 0)
+			{
+				if (zBuffer[x][y] > zCurrent)
+				{
+					zBuffer[x][y] = zCurrent;
+					pixels[(int)y][(int)x][0] = color[0];
+					pixels[(int)y][(int)x][1] = color[1];
+					pixels[(int)y][(int)x][2] = color[2];
+				}
+			}
+		}
+
+	}
+}
+
+
+
+void
+shadowtext(int x, int y, char* s) 
+{
+    int lines;
+    char* p;
+    
+    glDisable(GL_DEPTH_TEST);
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, glutGet(GLUT_WINDOW_WIDTH), 
+        0, glutGet(GLUT_WINDOW_HEIGHT), -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+    glColor3ub(0, 0, 0);
+    glRasterPos2i(x+1, y-1);
+    for(p = s, lines = 0; *p; p++) {
+        if (*p == '\n') {
+            lines++;
+            glRasterPos2i(x+1, y-1-(lines*18));
+        }
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, *p);
+    }
+    glColor3ub(0, 128, 255);
+    glRasterPos2i(x, y);
+    for(p = s, lines = 0; *p; p++) {
+        if (*p == '\n') {
+            lines++;
+            glRasterPos2i(x, y-(lines*18));
+        }
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, *p);
+    }
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+    glEnable(GL_DEPTH_TEST);
+}
+
+void
+lists(void)
+{
+    GLfloat ambient[] = { 0.2, 0.2, 0.2, 1.0 };
+    GLfloat diffuse[] = { 0.8, 0.8, 0.8, 1.0 };
+    GLfloat specular[] = { 0.0, 0.0, 0.0, 1.0 };
+    GLfloat shininess = 65.0;
+    
+    glMaterialfv(GL_FRONT, GL_AMBIENT, ambient);
+    glMaterialfv(GL_FRONT, GL_DIFFUSE, diffuse);
+    glMaterialfv(GL_FRONT, GL_SPECULAR, specular);
+    glMaterialf(GL_FRONT, GL_SHININESS, shininess);
+    
+    if (model_list)
+        glDeleteLists(model_list, 1);
+    
+    /* generate a list */
+    if (material_mode == 0) { 
+        if (facet_normal)
+            model_list = glmList(model, GLM_FLAT);
+        else
+            model_list = glmList(model, GLM_SMOOTH);
+    } else if (material_mode == 1) {
+        if (facet_normal)
+            model_list = glmList(model, GLM_FLAT | GLM_COLOR);
+        else
+            model_list = glmList(model, GLM_SMOOTH | GLM_COLOR);
+    } else if (material_mode == 2) {
+        if (facet_normal)
+            model_list = glmList(model, GLM_FLAT | GLM_MATERIAL);
+        else
+            model_list = glmList(model, GLM_SMOOTH | GLM_MATERIAL);
+    }
+}
+
+void
+init(void)
+{
+    gltbInit(GLUT_LEFT_BUTTON);
+    
+    /* read in the model */
+    model = glmReadOBJ(model_file);
+    scale = glmUnitize(model);
+    glmFacetNormals(model);
+    glmVertexNormals(model, smoothing_angle);
+    
+    if (model->nummaterials > 0)
+        material_mode = 2;
+    
+    /* create new display lists */
+    lists();
+    
+    glEnable(GL_LIGHTING);
+    glEnable(GL_LIGHT0);
+    glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE);
+    
+    glEnable(GL_DEPTH_TEST);
+    
+    glEnable(GL_CULL_FACE);
+}
+
+void
+reshape(int width, int height)
+{
+    gltbReshape(width, height);
+    
+    glViewport(0, 0, width, height);
+    
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluPerspective(60.0, (GLfloat)height / (GLfloat)width, 1.0, 128.0);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glTranslatef(0.0, 0.0, -3.0);
+}
+
+#define NUM_FRAMES 5
+void
+display(void)
+{
+	if (ycount%2==1)
+	{
+		myDisplay();
+	}
+	else{
+		static char s[256], t[32];
+		static char* p;
+		static int frames = 0;
+
+		glClearColor(1.0, 1.0, 1.0, 1.0);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+		glPushMatrix();
+
+		glTranslatef(pan_x, pan_y, 0.0);
+
+		gltbMatrix();
+
+#if 0   /* glmDraw() performance test */
+		if (material_mode == 0) { 
+			if (facet_normal)
+				glmDraw(model, GLM_FLAT);
+			else
+				glmDraw(model, GLM_SMOOTH);
+		} else if (material_mode == 1) {
+			if (facet_normal)
+				glmDraw(model, GLM_FLAT | GLM_COLOR);
+			else
+				glmDraw(model, GLM_SMOOTH | GLM_COLOR);
+		} else if (material_mode == 2) {
+			if (facet_normal)
+				glmDraw(model, GLM_FLAT | GLM_MATERIAL);
+			else
+				glmDraw(model, GLM_SMOOTH | GLM_MATERIAL);
+		}
+#else
+		glCallList(model_list);
+#endif
+
+		glDisable(GL_LIGHTING);
+		if (bounding_box) {
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+			glEnable(GL_BLEND);
+			glEnable(GL_CULL_FACE);
+			glColor4f(1.0, 0.0, 0.0, 0.25);
+			glutSolidCube(2.0);
+			glDisable(GL_BLEND);
+		}
+
+		glPopMatrix();
+
+		if (stats) {
+			/* XXX - this could be done a _whole lot_ faster... */
+			int height = glutGet(GLUT_WINDOW_HEIGHT);
+			glColor3ub(0, 0, 0);
+			sprintf(s, "%s\n%d vertices\n%d triangles\n%d normals\n"
+				"%d texcoords\n%d groups\n%d materials",
+				model->pathname, model->numvertices, model->numtriangles,
+				model->numnormals, model->numtexcoords, model->numgroups,
+				model->nummaterials);
+			shadowtext(5, height - (5 + 18 * 1), s);
+		}
+
+		/* spit out frame rate. */
+		frames++;
+		if (frames > NUM_FRAMES) {
+			sprintf(t, "%g fps", frames / elapsed());
+			frames = 0;
+		}
+		if (performance) {
+			shadowtext(5, 5, t);
+		}
+
+
+		glutSwapBuffers();
+		glEnable(GL_LIGHTING);
+	}
+}
+
+
+void myDisplay(void)
+{
+	int i, j, temp,temp2;
+	for (i = 0; i < 512; i++)
+	for (j = 0; j < 512; j++)
+	{
+		pixels[i][j][0] = 0;
+		pixels[i][j][1] = 0;
+		pixels[i][j][2] = 0;
+	}
+	
+
+	glPushMatrix();
+
+	glTranslatef(pan_x, pan_y, 0.0);
+
+	gltbMatrix();
+
+	GLdouble model2[4 * 4];
+	GLdouble proj[4 * 4];
+	GLint view[4];
+
+	for (i = 0; i < 512;i++)
+	for (j = 0; j < 512; j++)
+		zBuffer[i][j] = 512.0;
+
+	glGetDoublev(GL_MODELVIEW_MATRIX, model2);
+	glGetDoublev(GL_PROJECTION_MATRIX, proj);
+	glGetIntegerv(GL_VIEWPORT, view);
+
+	glClearColor(1.0, 1.0, 1.0, 1.0);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	GLMgroup* currentGroup = model->groups;
+	while (currentGroup)
+	{
+		int materialIndex = currentGroup->material;
+		GLMmaterial currentMaterial = model->materials[materialIndex];
+		GLfloat diffuseL[3],ambientL[3],specularL[3];
+
+
+		for (temp = 0; temp < 3; temp++)
+			diffuseL[temp] = currentMaterial.diffuse[temp];
+
+		for (temp = 0; temp < 3; temp++)
+			ambientL[temp] = currentMaterial.ambient[temp];
+
+		for (temp = 0; temp < 3; temp++)
+			specularL[temp] = currentMaterial.specular[temp];
+
+
+		for (i = 0; i < currentGroup->numtriangles; i++)
+		{
+			GLuint currentTriangleIndex = currentGroup->triangles[i];
+
+			GLMtriangle currentTriangle = model->triangles[currentTriangleIndex];
+
+			GLint facetNormalIndex = currentTriangle.findex;
+			GLfloat facetNormal[3];
+
+			for (temp = 0; temp < 3;temp++)
+			facetNormal[temp] = model->facetnorms[facetNormalIndex*3 +temp];
+
+
+			GLfloat newfacetNormalx = (model2[0] * facetNormal[0]) + (model2[4] * facetNormal[1]) + (model2[8] * facetNormal[2]);
+			GLfloat newfacetNormaly = (model2[1] * facetNormal[0]) + (model2[5] * facetNormal[1]) + (model2[9] * facetNormal[2]);
+			GLfloat newfacetNormalz = (model2[2] * facetNormal[0]) + (model2[6] * facetNormal[1]) + (model2[10] * facetNormal[2]);
+			
+			GLfloat lightdir[4];
+			glGetLightfv(GL_LIGHT0, GL_POSITION, &lightdir);
+
+			GLfloat dotPnl = max2(0.0,(newfacetNormalx * lightdir[0] + newfacetNormaly * lightdir[1] + newfacetNormalz * lightdir[2]));
+
+			GLfloat h[3];
+			h[0] = (0 + lightdir[0]) / 2;
+			h[1] = (0 + lightdir[1]) / 2;
+			h[2] = (1 + lightdir[2]) / 2;
+
+			GLfloat dotPnh = max2(0.0,(newfacetNormalx * h[0] + newfacetNormaly * h[1] + newfacetNormalz * h[2]));
+
+			//GLfloat dotP = fabs(facetNormal[0] * lightdir[0] + facetNormal[1] * lightdir[1] + facetNormal[2] * lightdir[2]);
+			/*if (newfacetNormalz < 0.0) {
+				newfacetNormalz = 0.0 - newfacetNormalz;
+			}
+
+			GLfloat dotP = newfacetNormalz;*/
+	
+			//GLfloat dotP = fabs(facetNormal[2]);
+			GLfloat colourRGB[3], colourRGB1[3], colourRGB2[3], colourRGB3[3];
+			for (temp = 0; temp < 3; temp++)
+				colourRGB[temp] = ambientL[temp] + diffuseL[temp] * dotPnl +ambientL[temp] * pow(dotPnh, 9);
+
+
+			if (gcount%2==1)
+			{
+				GLint vertexNormalIndices[3];
+
+				for (temp = 0; temp < 3; temp++)
+					vertexNormalIndices[temp] = currentTriangle.nindices[temp];
+
+
+				GLfloat vertexNormals[3][3];
+				for (temp = 0; temp < 3; temp++)
+				for (temp2 = 0; temp2 < 3; temp2++)
+					vertexNormals[temp][temp2] = model->normals[vertexNormalIndices[temp] * 3 + temp2];
+				//first vertexnormal
+				GLfloat newVertexNormal1x = (model2[0] * vertexNormals[0][0]) + (model2[4] * vertexNormals[0][1]) + (model2[8] * vertexNormals[0][2]);
+				GLfloat newVertexNormal1y = (model2[1] * vertexNormals[0][0]) + (model2[5] * vertexNormals[0][1]) + (model2[9] * vertexNormals[0][2]);
+				GLfloat newVertexNormal1z = (model2[2] * vertexNormals[0][0]) + (model2[6] * vertexNormals[0][1]) + (model2[10] * vertexNormals[0][2]);
+				GLfloat dotPnl1 = max2(0,(newVertexNormal1x * lightdir[0] + newVertexNormal1y * lightdir[1] + newVertexNormal1z * lightdir[2]));
+				GLfloat dotPnh1 = max2(0.0,(newVertexNormal1x * h[0] + newVertexNormal1y * h[1] + newVertexNormal1z * h[2]));
+				for (temp = 0; temp < 3; temp++)
+					colourRGB1[temp] = ambientL[temp] + diffuseL[temp] * dotPnl1 + ambientL[temp] * pow(dotPnh1, 9);
+
+				// second vertex normal
+				GLfloat newVertexNormal2x = (model2[0] * vertexNormals[1][0]) + (model2[4] * vertexNormals[1][1]) + (model2[8] * vertexNormals[1][2]);
+				GLfloat newVertexNormal2y = (model2[1] * vertexNormals[1][0]) + (model2[5] * vertexNormals[1][1]) + (model2[9] * vertexNormals[1][2]);
+				GLfloat newVertexNormal2z = (model2[2] * vertexNormals[1][0]) + (model2[6] * vertexNormals[1][1]) + (model2[10] * vertexNormals[1][2]);
+				GLfloat dotPnl2 = max2(0.0,(newVertexNormal2x * lightdir[0] + newVertexNormal2y * lightdir[1] + newVertexNormal2z * lightdir[2]));
+				GLfloat dotPnh2 = max2(0.0,(newVertexNormal2x * h[0] + newVertexNormal2y * h[1] + newVertexNormal2z * h[2]));
+
+				for (temp = 0; temp < 3; temp++)
+					colourRGB2[temp] = ambientL[temp] + diffuseL[temp] * dotPnl2 + ambientL[temp] * pow(dotPnh2, 9);
+
+				//third vertex normal
+				GLfloat newVertexNormal3x = (model2[0] * vertexNormals[2][0]) + (model2[4] * vertexNormals[2][1]) + (model2[8] * vertexNormals[2][2]);
+				GLfloat newVertexNormal3y = (model2[1] * vertexNormals[2][0]) + (model2[5] * vertexNormals[2][1]) + (model2[9] * vertexNormals[2][2]);
+				GLfloat newVertexNormal3z = (model2[2] * vertexNormals[2][0]) + (model2[6] * vertexNormals[2][1]) + (model2[10] * vertexNormals[2][2]);
+				GLfloat dotPnl3 = max2(0.0,(newVertexNormal3x * lightdir[0] + newVertexNormal3y * lightdir[1] + newVertexNormal3z * lightdir[2]));
+				GLfloat dotPnh3 = max2(0.0,(newVertexNormal3x * h[0] + newVertexNormal3y * h[1] + newVertexNormal3z * h[2]));
+
+				for (temp = 0; temp < 3; temp++)
+					colourRGB3[temp] = ambientL[temp] + diffuseL[temp] * dotPnl3 + ambientL[temp] * pow(dotPnh3, 9);
+			}
+
+
+			GLuint vertex1Index = currentTriangle.vindices[0];
+			GLuint vertex2Index = currentTriangle.vindices[1];
+			GLuint vertex3Index = currentTriangle.vindices[2];
+
+			GLfloat vertex1[3], vertex2[3], vertex3[3];
+			for (temp = 0; temp < 3; temp++) 
+				vertex1[temp] = model->vertices[vertex1Index * 3 + temp];
+
+			for (temp = 0; temp < 3; temp++)
+				vertex2[temp] = model->vertices[vertex2Index * 3 + temp];
+
+			for (temp = 0; temp < 3; temp++)
+				vertex3[temp] = model->vertices[vertex3Index * 3 + temp];
+
+
+			/*glBegin(GL_TRIANGLES);
+			glColor3f(1.0, 1.0, 1.0);
+
+			glVertex3f(vertex1[0], vertex1[1], vertex1[2]);
+			glVertex3f(vertex2[0], vertex2[1], vertex2[2]);
+			glVertex3f(vertex3[0], vertex3[1], vertex3[2]);
+			glEnd();*/
+
+
+		    GLdouble pvertex1[3], pvertex2[3], pvertex3[3];
+
+			gluProject((GLdouble)(vertex1[0]), (GLdouble)(vertex1[1]), (GLdouble)(vertex1[2]),
+				model2, proj, view,
+				&pvertex1[0], &pvertex1[1], &pvertex1[2]);
+
+			gluProject((GLdouble)(vertex2[0]), (GLdouble)(vertex2[1]), (GLdouble)(vertex2[2]),
+				model2, proj, view,
+				&pvertex2[0], &pvertex2[1], &pvertex2[2]);
+
+			gluProject((GLdouble)(vertex3[0]), (GLdouble)(vertex3[1]), (GLdouble)(vertex3[2]),
+				model2, proj, view,
+				&pvertex3[0], &pvertex3[1], &pvertex3[2]);
+			
+			
+			float vertices[4][3];
+
+			for (temp = 0; temp < 3; temp++)
+				vertices[0][temp] = pvertex1[temp];
+
+			for (temp = 0; temp < 3; temp++)
+				vertices[1][temp] = pvertex2[temp];
+
+			for (temp = 0; temp < 3; temp++)
+				vertices[2][temp] = pvertex3[temp];
+
+			for (temp = 0; temp < 3; temp++)
+				vertices[3][temp] = vertices[0][temp];
+
+
+			/*pixels[(int)vertex1y][(int)vertex1x][0] = (unsigned int)(trunc(255 * 255 * 255 * (255 * 0.9)));
+			pixels[(int)vertex2y][(int)vertex2x][0] = (unsigned int)(trunc(255 * 255 * 255 * (255 * 0.9)));
+			pixels[(int)vertex3y][(int)vertex3x][0] = (unsigned int)(trunc(255 * 255 * 255 * (255 * 0.9)));*/
+
+			DrawLine1((GLint)vertices[0][0], (GLint)vertices[0][1], (float)vertices[0][2], (GLint)vertices[1][0], (GLint)vertices[1][1], (float)vertices[1][2], colourRGB,colourRGB1,colourRGB2);
+			DrawLine1((GLint)vertices[1][0], (GLint)vertices[1][1], (float)vertices[1][2], (GLint)vertices[2][0], (GLint)vertices[2][1], (float)vertices[2][2], colourRGB, colourRGB2, colourRGB3);
+			DrawLine1((GLint)vertices[2][0], (GLint)vertices[2][1], (float)vertices[2][2], (GLint)vertices[0][0], (GLint)vertices[0][1], (float)vertices[0][2], colourRGB, colourRGB3, colourRGB1);
+
+
+
+			scanFill3(vertices, colourRGB, colourRGB1, colourRGB2, colourRGB3);
+
+		}
+
+		currentGroup = currentGroup->next;
+	}
+
+	glPopMatrix();
+	glDrawPixels(512, 512, GL_RGB, GL_FLOAT, pixels);
+	glutSwapBuffers();
+	
+}
+
+void
+keyboard(unsigned char key, int x, int y)
+{
+    GLint params[2];
+    
+    switch (key) {
+    case 'h':
+        printf("help\n\n");
+        printf("w         -  Toggle wireframe/filled\n");
+        printf("c         -  Toggle culling\n");
+        printf("n         -  Toggle facet/smooth normal\n");
+        printf("b         -  Toggle bounding box\n");
+        printf("r         -  Reverse polygon winding\n");
+        printf("m         -  Toggle color/material/none mode\n");
+        printf("p         -  Toggle performance indicator\n");
+        printf("s/S       -  Scale model smaller/larger\n");
+        printf("t         -  Show model stats\n");
+        printf("o         -  Weld vertices in model\n");
+        printf("+/-       -  Increase/decrease smoothing angle\n");
+        printf("W         -  Write model to file (out.obj)\n");
+        printf("q/escape  -  Quit\n\n");
+        break;
+        
+    case 't':
+        stats = !stats;
+        break;
+        
+    case 'p':
+        performance = !performance;
+        break;
+        
+    case 'm':
+        material_mode++;
+        if (material_mode > 2)
+            material_mode = 0;
+        printf("material_mode = %d\n", material_mode);
+        lists();
+        break;
+        
+    case 'd':
+        glmDelete(model);
+        init();
+        lists();
+        break;
+        
+    case 'w':
+        glGetIntegerv(GL_POLYGON_MODE, params);
+        if (params[0] == GL_FILL)
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+        else
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        break;
+        
+    case 'c':
+        if (glIsEnabled(GL_CULL_FACE))
+            glDisable(GL_CULL_FACE);
+        else
+            glEnable(GL_CULL_FACE);
+        break;
+        
+    case 'b':
+        bounding_box = !bounding_box;
+        break;
+        
+    case 'n':
+        facet_normal = !facet_normal;
+        lists();
+        break;
+        
+    case 'r':
+        glmReverseWinding(model);
+        lists();
+        break;
+        
+    case 's':
+        glmScale(model, 0.8);
+        lists();
+        break;
+        
+    case 'S':
+        glmScale(model, 1.25);
+        lists();
+        break;
+        
+    case 'o':
+        //printf("Welded %d\n", glmWeld(model, weld_distance));
+        glmVertexNormals(model, smoothing_angle);
+        lists();
+        break;
+        
+    case 'O':
+        weld_distance += 0.01;
+        printf("Weld distance: %.2f\n", weld_distance);
+        glmWeld(model, weld_distance);
+        glmFacetNormals(model);
+        glmVertexNormals(model, smoothing_angle);
+        lists();
+        break;
+        
+    case '-':
+        smoothing_angle -= 1.0;
+        printf("Smoothing angle: %.1f\n", smoothing_angle);
+        glmVertexNormals(model, smoothing_angle);
+        lists();
+        break;
+        
+    case '+':
+        smoothing_angle += 1.0;
+        printf("Smoothing angle: %.1f\n", smoothing_angle);
+        glmVertexNormals(model, smoothing_angle);
+        lists();
+        break;
+        
+    case 'W':
+        glmScale(model, 1.0/scale);
+        glmWriteOBJ(model, "out.obj", GLM_SMOOTH | GLM_MATERIAL);
+        break;
+        
+    case 'R':
+        {
+            GLuint i;
+            GLfloat swap;
+            for (i = 1; i <= model->numvertices; i++) {
+                swap = model->vertices[3 * i + 1];
+                model->vertices[3 * i + 1] = model->vertices[3 * i + 2];
+                model->vertices[3 * i + 2] = -swap;
+            }
+            glmFacetNormals(model);
+            lists();
+            break;
+        }
+	
+	case 'y':
+		{
+			//printf("y pressed");
+				
+				ycount++;
+			break;
+		}
+	case 'g':
+	{
+				//printf("y pressed");
+
+				gcount++;
+				break;
+	}
+        
+    case 27:
+        exit(0);
+        break;
+    }
+    
+    glutPostRedisplay();
+}
+
+void
+menu(int item)
+{
+    int i = 0;
+    DIR* dirp;
+    char* name;
+    struct dirent* direntp;
+    
+    if (item > 0) {
+        keyboard((unsigned char)item, 0, 0);
+    } else {
+        dirp = opendir(DATA_DIR);
+        while ((direntp = readdir(dirp)) != NULL) {
+            if (strstr(direntp->d_name, ".obj")) {
+                i++;
+                if (i == -item)
+                    break;
+            }
+        }
+        if (!direntp)
+            return;
+        name = (char*)malloc(strlen(direntp->d_name) + strlen(DATA_DIR) + 1);
+        strcpy(name, DATA_DIR);
+        strcat(name, direntp->d_name);
+        model = glmReadOBJ(name);
+        scale = glmUnitize(model);
+        glmFacetNormals(model);
+        glmVertexNormals(model, smoothing_angle);
+        
+        if (model->nummaterials > 0)
+            material_mode = 2;
+        else
+            material_mode = 0;
+        
+        lists();
+        free(name);
+        
+        glutPostRedisplay();
+    }
+}
+
+static GLint      mouse_state;
+static GLint      mouse_button;
+
+void
+mouse(int button, int state, int x, int y)
+{
+    GLdouble model[4*4];
+    GLdouble proj[4*4];
+    GLint view[4];
+    
+    /* fix for two-button mice -- left mouse + shift = middle mouse */
+    if (button == GLUT_LEFT_BUTTON && glutGetModifiers() & GLUT_ACTIVE_SHIFT)
+        button = GLUT_MIDDLE_BUTTON;
+    
+    gltbMouse(button, state, x, y);
+    
+    mouse_state = state;
+    mouse_button = button;
+    
+    if (state == GLUT_DOWN && button == GLUT_MIDDLE_BUTTON) {
+        glGetDoublev(GL_MODELVIEW_MATRIX, model);
+        glGetDoublev(GL_PROJECTION_MATRIX, proj);
+        glGetIntegerv(GL_VIEWPORT, view);
+        gluProject((GLdouble)x, (GLdouble)y, 0.0,
+            model, proj, view,
+            &pan_x, &pan_y, &pan_z);
+        gluUnProject((GLdouble)x, (GLdouble)y, pan_z,
+            model, proj, view,
+            &pan_x, &pan_y, &pan_z);
+        pan_y = -pan_y;
+    }
+    
+    glutPostRedisplay();
+}
+
+void
+motion(int x, int y)
+{
+    GLdouble model[4*4];
+    GLdouble proj[4*4];
+    GLint view[4];
+    
+    gltbMotion(x, y);
+    
+    if (mouse_state == GLUT_DOWN && mouse_button == GLUT_MIDDLE_BUTTON) {
+        glGetDoublev(GL_MODELVIEW_MATRIX, model);
+        glGetDoublev(GL_PROJECTION_MATRIX, proj);
+        glGetIntegerv(GL_VIEWPORT, view);
+        gluProject((GLdouble)x, (GLdouble)y, 0.0,
+            model, proj, view,
+            &pan_x, &pan_y, &pan_z);
+        gluUnProject((GLdouble)x, (GLdouble)y, pan_z,
+            model, proj, view,
+            &pan_x, &pan_y, &pan_z);
+        pan_y = -pan_y;
+    }
+    
+    glutPostRedisplay();
+}
+
+
+
+
+
+int
+main(int argc, char** argv)
+{
+    int buffering = GLUT_DOUBLE;
+    struct dirent* direntp;
+    DIR* dirp;
+    int models;
+    
+    glutInitWindowSize(512, 512);
+    glutInit(&argc, argv);
+    
+    while (--argc) {
+        if (strcmp(argv[argc], "-sb") == 0)
+            buffering = GLUT_SINGLE;
+        else
+            model_file = argv[argc];
+    }
+    
+    if (!model_file) {
+        model_file = "data/teapot.obj";
+    }
+    
+    glutInitDisplayMode(GLUT_RGB | GLUT_DEPTH | buffering);
+    glutCreateWindow("Smooth");
+    
+    glutReshapeFunc(reshape);
+    glutDisplayFunc(display);
+    glutKeyboardFunc(keyboard);
+    glutMouseFunc(mouse);
+    glutMotionFunc(motion);
+    
+    models = glutCreateMenu(menu);
+    dirp = opendir(DATA_DIR);
+    if (!dirp) {
+        fprintf(stderr, "%s: can't open data directory.\n", argv[0]);
+    } else {
+        while ((direntp = readdir(dirp)) != NULL) {
+            if (strstr(direntp->d_name, ".obj")) {
+                entries++;
+                glutAddMenuEntry(direntp->d_name, -entries);
+            }
+        }
+        closedir(dirp);
+    }
+    
+    glutCreateMenu(menu);
+    glutAddMenuEntry("Smooth", 0);
+    glutAddMenuEntry("", 0);
+    glutAddSubMenu("Models", models);
+    glutAddMenuEntry("", 0);
+    glutAddMenuEntry("[w]   Toggle wireframe/filled", 'w');
+    glutAddMenuEntry("[c]   Toggle culling on/off", 'c');
+    glutAddMenuEntry("[n]   Toggle face/smooth normals", 'n');
+    glutAddMenuEntry("[b]   Toggle bounding box on/off", 'b');
+    glutAddMenuEntry("[p]   Toggle frame rate on/off", 'p');
+    glutAddMenuEntry("[t]   Toggle model statistics", 't');
+    glutAddMenuEntry("[m]   Toggle color/material/none mode", 'm');
+    glutAddMenuEntry("[r]   Reverse polygon winding", 'r');
+    glutAddMenuEntry("[s]   Scale model smaller", 's');
+    glutAddMenuEntry("[S]   Scale model larger", 'S');
+    glutAddMenuEntry("[o]   Weld redundant vertices", 'o');
+    glutAddMenuEntry("[+]   Increase smoothing angle", '+');
+    glutAddMenuEntry("[-]   Decrease smoothing angle", '-');
+    glutAddMenuEntry("[W]   Write model to file (out.obj)", 'W');
+    glutAddMenuEntry("", 0);
+    glutAddMenuEntry("[Esc] Quit", 27);
+    glutAttachMenu(GLUT_RIGHT_BUTTON);
+    
+    init();
+    
+    glutMainLoop();
+    return 0;
+}
